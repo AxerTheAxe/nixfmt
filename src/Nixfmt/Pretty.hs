@@ -62,6 +62,7 @@ import Nixfmt.Types (
   mapLastToken',
   tokenText,
  )
+import Nixfmt.Util (isSpaces)
 import Prelude hiding (String)
 
 toLineComment :: TrailingComment -> Trivium
@@ -150,8 +151,16 @@ instance Pretty Binder where
   pretty (Assignment selectors assign expr semicolon) =
     group $
       hcat selectors
-        <> nest (hardspace <> pretty assign <> nest (absorbRHS expr))
+        <> nest (hardspace <> pretty assign <> nest rhs)
         <> pretty semicolon
+    where
+      rhs =
+        -- In most cases, the LHS of a binding is fairly short. This means that when the RHS
+        -- overflows the line length limit, inserting a line break after the `=` does little good:
+        -- It won't reduce the overall line length by much while making the code uglier.
+        if length selectors <= 4 && all isSimpleSelector selectors
+          then absorbRHS expr
+          else line' <> group' Priority (absorbRHS expr)
 
 -- Pretty a set
 -- while we already pretty eagerly expand sets with more than one element,
@@ -381,6 +390,12 @@ prettyApp indentFunction pre hasPost f a =
       -- because if they get expanded before anything else,
       -- only the `.`-and-after part gets to a new line, which looks very odd
       absorbApp (Application f' a'@(Term Selection{})) = group' Transparent (absorbApp f') <> line <> nest (group' RegularG $ absorbInner a')
+      -- If two consecutive arguments are lists, treat them specially: Don't priority expand, and also
+      -- if one does not fit onto the line then put both on a new line each.
+      -- Note that this does not handle the case where the two last arguments are lists, as the last argument
+      -- is handled elsewhere and cannot be pattern-matched here.
+      absorbApp (Application (Application f' l1@(Term List{})) l2@(Term List{})) =
+        group' Transparent (group' Transparent (absorbApp f') <> nest (group' RegularG $ line <> group (absorbInner l1) <> line <> group (absorbInner l2)))
       absorbApp (Application f' a') = group' Transparent (absorbApp f') <> line <> nest (group' Priority $ absorbInner a')
       -- First argument
       absorbApp expr
@@ -392,13 +407,16 @@ prettyApp indentFunction pre hasPost f a =
       -- If lists have only simple items, try to render them single-line instead of expanding
       -- This is just a copy of the list rendering code, but with `sepBy line` instead of `sepBy hardline`
       absorbInner (Term (List paropen@Ann{trailComment = post'} items parclose))
-        | length (unItems items) <= 4 && all (isSimple . Term) items =
+        | length (unItems items) <= 6 && all (isSimple . Term) items =
             pretty (paropen{trailComment = Nothing})
               <> surroundWith sur (nest $ pretty post' <> sepBy line (unItems items))
               <> pretty parclose
         where
           -- If the brackets are on different lines, keep them like that
-          sur = if sourceLine paropen /= sourceLine parclose then hardline else line
+          sur
+            | sourceLine paropen /= sourceLine parclose = hardline
+            | null $ unItems items = hardspace
+            | otherwise = line
       absorbInner expr = pretty expr
 
       -- Render the last argument of a function call
@@ -451,15 +469,35 @@ prettyApp indentFunction pre hasPost f a =
           ((\a'@Ann{preTrivia} -> (a'{preTrivia = []}, preTrivia)) . moveTrailingCommentUp)
           f
 
-      renderedF = pre <> group' Transparent (absorbApp fWithoutComment)
-      renderedFUnexpanded = unexpandSpacing' Nothing renderedF
+      -- renderSimple will take a document to render, and call one of two callbacks depending on whether
+      -- it can take a simplified layout (with removed line breaks) or not.
+      renderSimple :: Doc -> (Doc -> Doc) -> (Doc -> Doc) -> Doc
+      renderSimple toRender renderIfSimple renderOtherwise =
+        let renderedF = pre <> group' Transparent toRender
+            renderedFUnexpanded = unexpandSpacing' Nothing renderedF
+        in if isSimple (Application f a) && isJust renderedFUnexpanded
+            then renderIfSimple (fromJust renderedFUnexpanded)
+            else renderOtherwise renderedF
 
       post = if hasPost then line' else mempty
   in pretty comment'
-      <> ( if isSimple (Application f a) && isJust renderedFUnexpanded
-            then group' RegularG $ fromJust renderedFUnexpanded <> hardspace <> absorbLast a
-            else group' RegularG $ renderedF <> line <> absorbLast a <> post
-         )
+      <> case (fWithoutComment, a) of
+        -- When the two last arguments are lists, render these specially (same as above)
+        -- Also no need to wrap in renderSimple here, because we know that these kinds of arguments
+        -- are never "simple" by definition.
+        (Application fWithoutCommandAndWithoutArg l1@(Term List{}), l2@(Term List{})) ->
+          group' RegularG $
+            (pre <> group' Transparent (absorbApp fWithoutCommandAndWithoutArg))
+              <> line
+              <> nest (group (absorbInner l1))
+              <> line
+              <> nest (group (absorbInner l2))
+              <> post
+        _ ->
+          renderSimple
+            (absorbApp fWithoutComment)
+            (\fRendered -> group' RegularG $ fRendered <> hardspace <> absorbLast a)
+            (\fRendered -> group' RegularG $ fRendered <> line <> absorbLast a <> post)
       <> (if hasPost && not (null comment') then hardline else mempty)
 
 prettyWith :: Bool -> Expression -> Doc
@@ -502,6 +540,12 @@ isAbsorbable (Path _) = True
 -- Non-empty sets and lists
 isAbsorbable (Set _ _ (Items (_ : _)) _) = True
 isAbsorbable (List _ (Items (_ : _)) _) = True
+-- Empty sets and lists if they have a line break
+-- https://github.com/NixOS/nixfmt/issues/253
+isAbsorbable (Set _ (Ann{sourceLine = line1}) (Items []) (Ann{sourceLine = line2}))
+  | line1 /= line2 = True
+isAbsorbable (List (Ann{sourceLine = line1}) (Items []) (Ann{sourceLine = line2}))
+  | line1 /= line2 = True
 isAbsorbable (Parenthesized (LoneAnn _) (Term t) _) = isAbsorbable t
 isAbsorbable _ = False
 
@@ -565,7 +609,11 @@ absorbRHS expr = case expr of
   -- Special case `//` and `++` operations to be more compact in some cases
   -- Case 1: two arguments, LHS is absorbable term, RHS fits onto the last line
   (Operation (Term t) (LoneAnn op) b)
-    | isAbsorbable t && isUpdateOrConcat op ->
+    | isAbsorbable t
+        && isUpdateOrConcat op
+        -- Exclude further operations on the RHS
+        -- Hotfix for https://github.com/NixOS/nixfmt/issues/198
+        && case b of (Operation{}) -> False; _ -> True ->
         group' RegularG $ line <> group' Priority (prettyTermWide t) <> line <> pretty op <> hardspace <> pretty b
   -- Case 2a: LHS fits onto first line, RHS is an absorbable term
   (Operation l (LoneAnn op) (Term t))
@@ -598,31 +646,13 @@ instance Pretty Expression where
       convertTrailing Nothing = []
       convertTrailing (Just (TrailingComment t)) = [LineComment (" " <> t)]
 
-      -- Extract detached comments at the bottom.
-      -- This uses a custom variant of span/spanJust/spanMaybe.
-      -- Note that this is a foldr which walks from the bottom, but the lists
-      -- are constructed in a way that they end up correct again.
-      (binderComments, bindersWithoutComments) =
-        foldr
-          ( \item (start, rest) -> case item of
-              (Comments inner)
-                | null rest ->
-                    -- Only move all non-empty-line trivia below the `in`
-                    let (comments, el) = break (== EmptyLine) (reverse inner)
-                    in (reverse comments : start, Comments (reverse el) : rest)
-              _ -> (start, item : rest)
-          )
-          ([], [])
-          (unItems binders)
-
       letPart = group $ pretty let_ <> hardline <> letBody
-      letBody = nest $ prettyItems (Items bindersWithoutComments)
+      letBody = nest $ prettyItems binders
       inPart =
         group $
           pretty in_
             <> hardline
-            -- Take our trailing and inject it between `in` and body
-            <> pretty (concat binderComments ++ preTrivia ++ convertTrailing trailComment)
+            <> pretty (preTrivia ++ convertTrailing trailComment)
             <> pretty expr
   pretty (Assert assert cond semicolon expr) =
     group $
@@ -734,6 +764,9 @@ isSimple (Term (SimpleString (LoneAnn _))) = True
 isSimple (Term (IndentedString (LoneAnn _))) = True
 isSimple (Term (Path (LoneAnn _))) = True
 isSimple (Term (Token (LoneAnn (Identifier _)))) = True
+isSimple (Term (Token (LoneAnn (Integer _)))) = True
+isSimple (Term (Token (LoneAnn (Float _)))) = True
+isSimple (Term (Token (LoneAnn (EnvPath _)))) = True
 isSimple (Term (Selection t selectors def)) =
   isSimple (Term t) && all isSimpleSelector selectors && isNothing def
 isSimple (Term (Parenthesized (LoneAnn _) e (LoneAnn _))) = isSimple e
@@ -771,11 +804,13 @@ instance Pretty StringPart where
           (unexpandSpacing' (Just 30) whole')
 
 instance Pretty [StringPart] where
-  -- When the interpolation is the only thing on the string line,
+  -- When the interpolation is the only thing on the string line (ignoring leading whitespace),
   -- then absorb the content (i.e. don't surround with line').
   -- Only do this when there are no comments
-  pretty [Interpolation (Whole expr [])] =
-    group $ text "${" <> nest inner <> text "}"
+  pretty [Interpolation (Whole expr [])] = pretty [TextPart "", Interpolation (Whole expr [])]
+  pretty [TextPart pre, Interpolation (Whole expr [])]
+    | isSpaces pre =
+        text pre <> offset (textWidth pre) (group $ text "${" <> nest inner <> text "}")
     where
       -- Code copied over from parentheses. Could be factored out into a common function one day
       inner = case expr of

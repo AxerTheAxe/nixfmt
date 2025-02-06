@@ -51,7 +51,8 @@ let
       post_max_size = cfg.maxUploadSize;
       memory_limit = cfg.maxUploadSize;
     }
-    // cfg.phpOptions // optionalAttrs cfg.caching.apcu { "apc.enable_cli" = "1"; };
+    // cfg.phpOptions
+    // optionalAttrs cfg.caching.apcu { "apc.enable_cli" = "1"; };
 
   occ = pkgs.writeScriptBin "nextcloud-occ" ''
     #! ${pkgs.runtimeShell}
@@ -839,11 +840,9 @@ in
                     'use_ssl' => ${boolToString s3.useSsl},
                     ${optionalString (s3.region != null) "'region' => '${s3.region}',"}
                     'use_path_style' => ${boolToString s3.usePathStyle},
-                    ${
-                      optionalString (
-                        s3.sseCKeyFile != null
-                      ) "'sse_c_key' => nix_read_secret('${s3.sseCKeyFile}'),"
-                    }
+                    ${optionalString (
+                      s3.sseCKeyFile != null
+                    ) "'sse_c_key' => nix_read_secret('${s3.sseCKeyFile}'),"}
                   ],
                 ]
               '';
@@ -885,9 +884,8 @@ in
               }
               $CONFIG = [
                 'apps_paths' => [
-                  ${
-                    optionalString (cfg.extraApps != { })
-                      "[ 'path' => '${cfg.home}/nix-apps', 'url' => '/nix-apps', 'writable' => false ],"
+                  ${optionalString (cfg.extraApps != { })
+                    "[ 'path' => '${cfg.home}/nix-apps', 'url' => '/nix-apps', 'writable' => false ],"
                   }
                   [ 'path' => '${cfg.home}/apps', 'url' => '/apps', 'writable' => false ],
                   [ 'path' => '${cfg.home}/store-apps', 'url' => '/store-apps', 'writable' => true ],
@@ -898,37 +896,29 @@ in
                 ${optionalString cfg.caching.apcu "'memcache.local' => '\\OC\\Memcache\\APCu',"}
                 'log_type' => '${cfg.logType}',
                 'loglevel' => '${builtins.toString cfg.logLevel}',
-                ${
-                  optionalString (
-                    c.overwriteProtocol != null
-                  ) "'overwriteprotocol' => '${c.overwriteProtocol}',"
-                }
+                ${optionalString (
+                  c.overwriteProtocol != null
+                ) "'overwriteprotocol' => '${c.overwriteProtocol}',"}
                 ${optionalString (c.dbname != null) "'dbname' => '${c.dbname}',"}
                 ${optionalString (c.dbhost != null) "'dbhost' => '${c.dbhost}',"}
                 ${optionalString (c.dbport != null) "'dbport' => '${toString c.dbport}',"}
                 ${optionalString (c.dbuser != null) "'dbuser' => '${c.dbuser}',"}
-                ${
-                  optionalString (
-                    c.dbtableprefix != null
-                  ) "'dbtableprefix' => '${toString c.dbtableprefix}',"
-                }
-                ${
-                  optionalString (c.dbpassFile != null) ''
-                    'dbpassword' => nix_read_secret(
-                      "${c.dbpassFile}"
-                    ),
-                  ''
-                }
+                ${optionalString (
+                  c.dbtableprefix != null
+                ) "'dbtableprefix' => '${toString c.dbtableprefix}',"}
+                ${optionalString (c.dbpassFile != null) ''
+                  'dbpassword' => nix_read_secret(
+                    "${c.dbpassFile}"
+                  ),
+                ''}
                 'dbtype' => '${c.dbtype}',
                 'trusted_domains' => ${
                   writePhpArray ([ cfg.hostName ] ++ c.extraTrustedDomains)
                 },
                 'trusted_proxies' => ${writePhpArray (c.trustedProxies)},
-                ${
-                  optionalString (
-                    c.defaultPhoneRegion != null
-                  ) "'default_phone_region' => '${c.defaultPhoneRegion}',"
-                }
+                ${optionalString (
+                  c.defaultPhoneRegion != null
+                ) "'default_phone_region' => '${c.defaultPhoneRegion}',"}
                 ${optionalString (nextcloudGreaterOrEqualThan "23") "'profile.enabled' => ${boolToString cfg.globalProfiles},"}
                 ${objectstoreConfig}
               ];
@@ -965,9 +955,8 @@ in
                     # will be omitted.
                     ${if c.dbname != null then "--database-name" else null} = ''"${c.dbname}"'';
                     ${if c.dbhost != null then "--database-host" else null} = ''"${c.dbhost}"'';
-                    ${
-                      if c.dbport != null then "--database-port" else null
-                    } = ''"${toString c.dbport}"'';
+                    ${if c.dbport != null then "--database-port" else null} =
+                      ''"${toString c.dbport}"'';
                     ${if c.dbuser != null then "--database-user" else null} = ''"${c.dbuser}"'';
                     "--database-pass" = "\"\$${dbpass.arg}\"";
                     "--admin-user" = ''"${c.adminuser}"'';
@@ -1179,27 +1168,29 @@ in
           "~ ^/(?:build|tests|config|lib|3rdparty|templates|data)(?:$|/)".extraConfig = ''
             return 404;
           '';
-          "~ ^/(?:\\.(?!well-known)|autotest|occ|issue|indie|db_|console)".extraConfig = ''
-            return 404;
-          '';
-          "~ ^\\/(?:index|remote|public|cron|core\\/ajax\\/update|status|ocs\\/v[12]|updater\\/.+|oc[ms]-provider\\/.+|.+\\/richdocumentscode\\/proxy)\\.php(?:$|\\/)" = {
-            priority = 500;
-            extraConfig = ''
-              include ${config.services.nginx.package}/conf/fastcgi.conf;
-              fastcgi_split_path_info ^(.+?\.php)(\\/.*)$;
-              set $path_info $fastcgi_path_info;
-              try_files $fastcgi_script_name =404;
-              fastcgi_param PATH_INFO $path_info;
-              fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-              fastcgi_param HTTPS ${if cfg.https then "on" else "off"};
-              fastcgi_param modHeadersAvailable true;
-              fastcgi_param front_controller_active true;
-              fastcgi_pass unix:${fpm.socket};
-              fastcgi_intercept_errors on;
-              fastcgi_request_buffering off;
-              fastcgi_read_timeout ${builtins.toString cfg.fastcgiTimeout}s;
+          "~ ^/(?:\\.(?!well-known)|autotest|occ|issue|indie|db_|console)".extraConfig =
+            ''
+              return 404;
             '';
-          };
+          "~ ^\\/(?:index|remote|public|cron|core\\/ajax\\/update|status|ocs\\/v[12]|updater\\/.+|oc[ms]-provider\\/.+|.+\\/richdocumentscode\\/proxy)\\.php(?:$|\\/)" =
+            {
+              priority = 500;
+              extraConfig = ''
+                include ${config.services.nginx.package}/conf/fastcgi.conf;
+                fastcgi_split_path_info ^(.+?\.php)(\\/.*)$;
+                set $path_info $fastcgi_path_info;
+                try_files $fastcgi_script_name =404;
+                fastcgi_param PATH_INFO $path_info;
+                fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                fastcgi_param HTTPS ${if cfg.https then "on" else "off"};
+                fastcgi_param modHeadersAvailable true;
+                fastcgi_param front_controller_active true;
+                fastcgi_pass unix:${fpm.socket};
+                fastcgi_intercept_errors on;
+                fastcgi_request_buffering off;
+                fastcgi_read_timeout ${builtins.toString cfg.fastcgiTimeout}s;
+              '';
+            };
           "~ \\.(?:css|js|woff2?|svg|gif|map)$".extraConfig = ''
             try_files $uri /index.php$request_uri;
             expires 6M;
